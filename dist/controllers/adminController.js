@@ -1,0 +1,874 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getMarketCoins = exports.suspendUser = exports.updateUserWallet = exports.getUserById = exports.getAllUsersWithWallets = exports.getCoinNetworks = exports.unlinkCoinFromNetwork = exports.linkCoinToNetwork = exports.deleteCoin = exports.toggleCoinStatus = exports.reactivateCoin = exports.deactivateCoin = exports.updateCoin = exports.getCoinById = exports.getAllCoins = exports.createCoin = void 0;
+const prisma_1 = require("../utils/prisma");
+const zod_1 = require("zod");
+const prisma_error_handler_1 = require("../utils/prisma-error-handler");
+const suspendSchema = zod_1.z.object({
+    suspend: zod_1.z.boolean(),
+    reason: zod_1.z.string().optional().nullable(),
+});
+// Schemas
+const createCoinSchema = zod_1.z.object({
+    symbol: zod_1.z.string().min(1).toUpperCase(),
+    name: zod_1.z.string().min(1),
+    iconUrl: zod_1.z.string().optional(),
+    isActive: zod_1.z.boolean().optional().default(true),
+});
+const updateCoinSchema = zod_1.z.object({
+    symbol: zod_1.z.string().min(1).toUpperCase().optional(),
+    name: zod_1.z.string().min(1).optional(),
+    iconUrl: zod_1.z.string().optional(),
+    isActive: zod_1.z.boolean().optional(),
+});
+const linkCoinNetworkSchema = zod_1.z.object({
+    coinId: zod_1.z.string(),
+    networkId: zod_1.z.string(),
+    contractAddress: zod_1.z.string().optional(),
+    decimals: zod_1.z.number().optional(),
+});
+let network = null;
+const createCoin = async (req, res) => {
+    try {
+        const schema = createCoinSchema.extend({
+            networkId: zod_1.z.string().uuid().optional(),
+            networkName: zod_1.z.string().optional(),
+            networkType: zod_1.z.string().optional(),
+            contractAddress: zod_1.z.string().optional(),
+            decimals: zod_1.z.number().optional().default(18),
+        });
+        const data = schema.parse(req.body);
+        const { networkId, networkName, networkType, contractAddress, decimals, ...coinData } = data;
+        const result = await prisma_1.prisma.$transaction(async (tx) => {
+            // 1️⃣ FIND or CREATE coin (KEY FIX)
+            const coin = (await tx.coin.findFirst({
+                where: {
+                    symbol: coinData.symbol,
+                    name: coinData.name,
+                },
+            })) ??
+                (await tx.coin.create({
+                    data: coinData,
+                }));
+            let coinNetwork = null;
+            // 2️⃣ Attach network if provided
+            if (networkId || networkName) {
+                let network = null;
+                if (networkId) {
+                    network = await tx.network.findUnique({
+                        where: { id: networkId },
+                    });
+                }
+                else if (networkName) {
+                    network = await tx.network.findFirst({
+                        where: {
+                            name: networkName,
+                            ...(networkType ? { type: networkType } : {}),
+                        },
+                    });
+                }
+                if (!network && networkName) {
+                    network = await tx.network.create({
+                        data: {
+                            name: networkName,
+                            type: networkType || "CUSTOM",
+                            isActive: true,
+                        },
+                    });
+                }
+                if (!network) {
+                    throw new Error("Network could not be resolved");
+                }
+                const isNative = network.type?.toLowerCase().includes("native") ?? false;
+                if (!isNative && !contractAddress) {
+                    throw new Error(`Contract address is required for ${network.type} tokens`);
+                }
+                // 3️⃣ Idempotent coin-network link (KEY FIX)
+                coinNetwork =
+                    (await tx.coinNetwork.findFirst({
+                        where: {
+                            coinId: coin.id,
+                            networkId: network.id,
+                            contractAddress: contractAddress ?? null,
+                        },
+                        include: { network: true },
+                    })) ??
+                        (await tx.coinNetwork.create({
+                            data: {
+                                coinId: coin.id,
+                                networkId: network.id,
+                                contractAddress: contractAddress ?? null,
+                                decimals,
+                                isActive: true,
+                            },
+                            include: { network: true },
+                        }));
+            }
+            return { coin, coinNetwork };
+        });
+        return res.status(201).json({
+            success: true,
+            message: result.coinNetwork
+                ? "Coin saved and linked to network"
+                : "Coin saved successfully",
+            coin: result.coin,
+            coinNetwork: result.coinNetwork,
+        });
+    }
+    catch (error) {
+        console.error("Create coin error:", error);
+        if (error instanceof zod_1.z.ZodError) {
+            return res.status(400).json({
+                success: false,
+                error: "Validation failed",
+                details: error.errors,
+            });
+        }
+        return res.status(400).json({
+            success: false,
+            error: error instanceof Error ? error.message : "Failed to create coin",
+        });
+    }
+};
+exports.createCoin = createCoin;
+const getAllCoins = async (req, res) => {
+    try {
+        const { includeInactive = "false" } = req.query;
+        const coins = await prisma_1.prisma.coin.findMany({
+            where: includeInactive === "true" ? {} : { isActive: true },
+            include: {
+                networks: {
+                    include: {
+                        network: true,
+                    },
+                },
+                _count: {
+                    select: {
+                        wallets: true,
+                        orders: true,
+                        networks: true,
+                    },
+                },
+            },
+            orderBy: [{ isActive: "desc" }, { name: "asc" }],
+        });
+        res.json({
+            success: true,
+            count: coins.length,
+            coins,
+        });
+    }
+    catch (error) {
+        console.error("Get all coins error:", error);
+        res.status(500).json({
+            error: "Failed to fetch coins",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.getAllCoins = getAllCoins;
+const getCoinById = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id },
+            include: {
+                networks: {
+                    include: {
+                        network: true,
+                    },
+                },
+                wallets: {
+                    include: {
+                        user: {
+                            select: {
+                                id: true,
+                                email: true,
+                                isVerified: true,
+                            },
+                        },
+                    },
+                    take: 10,
+                },
+                orders: {
+                    orderBy: { createdAt: "desc" },
+                    take: 10,
+                },
+                _count: {
+                    select: {
+                        wallets: true,
+                        orders: true,
+                        networks: true,
+                    },
+                },
+            },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+                details: `Coin with ID ${id} does not exist`,
+            });
+        }
+        res.json({
+            success: true,
+            coin,
+        });
+    }
+    catch (error) {
+        console.error("Get coin by ID error:", error);
+        res.status(500).json({
+            error: "Failed to fetch coin",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.getCoinById = getCoinById;
+const updateCoin = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const data = updateCoinSchema.parse(req.body);
+        // Check if coin exists
+        const existingCoin = await prisma_1.prisma.coin.findUnique({
+            where: { id },
+        });
+        if (!existingCoin) {
+            return res.status(404).json({
+                error: "Coin not found",
+                details: `Coin with ID ${id} does not exist`,
+            });
+        }
+        // If symbol is being updated, check for conflicts
+        if (data.symbol && data.symbol !== existingCoin.symbol) {
+            const symbolConflict = await prisma_1.prisma.coin.findUnique({
+                where: { symbol: data.symbol },
+            });
+            if (symbolConflict) {
+                return res.status(409).json({
+                    error: "Symbol conflict",
+                    details: `Another coin with symbol ${data.symbol} already exists`,
+                });
+            }
+        }
+        const coin = await prisma_1.prisma.coin.update({
+            where: { id },
+            data,
+            include: {
+                networks: {
+                    include: { network: true },
+                },
+            },
+        });
+        res.json({
+            success: true,
+            message: "Coin updated successfully",
+            coin,
+        });
+    }
+    catch (error) {
+        if (error instanceof zod_1.z.ZodError) {
+            return res.status(400).json({
+                error: "Validation failed",
+                details: error.errors,
+            });
+        }
+        console.error("Update coin error:", error);
+        res.status(500).json({
+            error: "Failed to update coin",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.updateCoin = updateCoin;
+/**
+ * Deactivate a coin if it has at least one wallet created by a user
+ */
+const deactivateCoin = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id },
+            include: {
+                wallets: { select: { id: true } },
+            },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+            });
+        }
+        /**
+         * CASE 1:
+         * No wallets → Safe to DELETE coin
+         */
+        if (coin.wallets.length === 0) {
+            await prisma_1.prisma.coin.delete({
+                where: { id },
+            });
+            return res.json({
+                success: true,
+                message: "Coin deleted successfully (no wallets existed)",
+            });
+        }
+        /**
+         * CASE 2:
+         * Wallets exist → Deactivate coin
+         */
+        if (!coin.isActive) {
+            return res.status(400).json({
+                error: "Coin already inactive",
+            });
+        }
+        const updatedCoin = await prisma_1.prisma.coin.update({
+            where: { id },
+            data: { isActive: false },
+        });
+        res.json({
+            success: true,
+            message: "Coin deactivated successfully",
+            coin: updatedCoin,
+        });
+    }
+    catch (error) {
+        console.error("Deactivate/Delete coin error:", error);
+        res.status(500).json({
+            error: "Failed to process coin action",
+        });
+    }
+};
+exports.deactivateCoin = deactivateCoin;
+/**
+ * Reactivate a previously deactivated coin
+ */
+const reactivateCoin = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+            });
+        }
+        if (coin.isActive) {
+            return res.status(400).json({
+                error: "Coin already active",
+            });
+        }
+        const updatedCoin = await prisma_1.prisma.coin.update({
+            where: { id },
+            data: { isActive: true },
+        });
+        res.json({
+            success: true,
+            message: "Coin reactivated successfully",
+            coin: updatedCoin,
+        });
+    }
+    catch (error) {
+        console.error("Reactivate coin error:", error);
+        res.status(500).json({
+            error: "Failed to reactivate coin",
+        });
+    }
+};
+exports.reactivateCoin = reactivateCoin;
+const toggleCoinStatus = async (req, res) => {
+    try {
+        const { coinId, toggleNetworks = true } = req.body;
+        console.log(coinId, toggleNetworks);
+        if (!coinId) {
+            return res.status(400).json({
+                error: "coinId is required",
+            });
+        }
+        // 1️⃣ Check if coin exists
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id: coinId },
+            include: {
+                networks: true,
+                _count: {
+                    select: {
+                        wallets: true,
+                        orders: true,
+                        networks: true,
+                    },
+                },
+            },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+            });
+        }
+        const newStatus = !coin.isActive;
+        // 2️⃣ Atomic toggle
+        const updatedCoin = await prisma_1.prisma.$transaction(async (tx) => {
+            const updated = await tx.coin.update({
+                where: { id: coinId },
+                data: { isActive: newStatus },
+            });
+            // 3️⃣ Optionally toggle coin networks
+            if (toggleNetworks) {
+                await tx.coinNetwork.updateMany({
+                    where: { coinId },
+                    data: { isActive: newStatus },
+                });
+            }
+            return updated;
+        });
+        res.json({
+            success: true,
+            message: `Coin ${newStatus ? "activated" : "deactivated"} successfully`,
+            data: {
+                id: updatedCoin.id,
+                isActive: updatedCoin.isActive,
+                walletsAffected: coin._count.wallets,
+                ordersAffected: coin._count.orders,
+                networksAffected: coin._count.networks,
+                networksToggled: toggleNetworks,
+            },
+        });
+    }
+    catch (error) {
+        console.error("Toggle coin status error:", error);
+        res.status(500).json({
+            error: "Failed to toggle coin status",
+        });
+    }
+};
+exports.toggleCoinStatus = toggleCoinStatus;
+const deleteCoin = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { force = "false" } = req.query;
+        // Check if coin exists
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id },
+            include: {
+                networks: {
+                    include: { network: true },
+                },
+                _count: {
+                    select: {
+                        wallets: true,
+                        orders: true,
+                        networks: true,
+                    },
+                },
+            },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+                details: `Coin with ID ${id} does not exist`,
+            });
+        }
+        // Check if coin can be safely deleted
+        if (force !== "true") {
+            const hasWallets = coin._count.wallets > 0;
+            const hasOrders = coin._count.orders > 0;
+            if (hasWallets || hasOrders) {
+                return res.status(400).json({
+                    error: "Cannot delete coin",
+                    details: "Coin has active references",
+                    references: {
+                        wallets: coin._count.wallets,
+                        orders: coin._count.orders,
+                        networks: coin._count.networks,
+                    },
+                    suggestion: "Use ?force=true to force delete, or deactivate instead",
+                });
+            }
+        }
+        // Use transaction for safe deletion
+        const result = await prisma_1.prisma.$transaction(async (prisma) => {
+            // First delete all CoinNetwork associations
+            await prisma.coinNetwork.deleteMany({
+                where: { coinId: id },
+            });
+            // Then delete the coin
+            return await prisma.coin.delete({
+                where: { id },
+            });
+        });
+        res.json({
+            success: true,
+            message: "Coin deleted permanently",
+            details: {
+                coin: coin.name,
+                symbol: coin.symbol,
+                networksDeleted: coin._count.networks,
+                forceDeleted: force === "true",
+            },
+        });
+    }
+    catch (error) {
+        console.error("Delete coin error:", error);
+        if ((0, prisma_error_handler_1.isPrismaError)(error)) {
+            const { status, message, details } = (0, prisma_error_handler_1.handlePrismaError)(error);
+            return res.status(status).json({
+                error: message,
+                details,
+                prismaCode: error.code,
+            });
+        }
+        // Fallback for completely unknown errors
+        res.status(500).json({
+            error: "Failed to delete coin",
+            details: "An unknown error occurred",
+        });
+    }
+};
+exports.deleteCoin = deleteCoin;
+const linkCoinToNetwork = async (req, res) => {
+    try {
+        const data = linkCoinNetworkSchema.parse(req.body);
+        // Check if coin exists
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id: data.coinId },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+                details: `Coin with ID ${data.coinId} does not exist`,
+            });
+        }
+        // Check if network exists
+        const network = await prisma_1.prisma.network.findUnique({
+            where: { id: data.networkId },
+        });
+        if (!network) {
+            return res.status(404).json({
+                error: "Network not found",
+                details: `Network with ID ${data.networkId} does not exist`,
+            });
+        }
+        // Check if link already exists
+        const existingLink = await prisma_1.prisma.coinNetwork.findFirst({
+            where: {
+                coinId: data.coinId,
+                networkId: data.networkId,
+            },
+        });
+        if (existingLink) {
+            return res.status(409).json({
+                error: "Link already exists",
+                details: `Coin ${coin.symbol} is already linked to network ${network.name}`,
+                link: existingLink,
+            });
+        }
+        // For contract addresses, check uniqueness within the network
+        if (data.contractAddress) {
+            const existingContract = await prisma_1.prisma.coinNetwork.findFirst({
+                where: {
+                    networkId: data.networkId,
+                    contractAddress: data.contractAddress,
+                },
+            });
+            if (existingContract) {
+                return res.status(409).json({
+                    error: "Contract address already in use",
+                    details: `Contract address ${data.contractAddress} is already used for another coin on this network`,
+                });
+            }
+        }
+        const link = await prisma_1.prisma.coinNetwork.create({
+            data: {
+                ...data,
+                isActive: true,
+            },
+            include: {
+                coin: true,
+                network: true,
+            },
+        });
+        res.status(201).json({
+            success: true,
+            message: "Coin linked to network successfully",
+            link,
+        });
+    }
+    catch (error) {
+        if (error instanceof zod_1.z.ZodError) {
+            return res.status(400).json({
+                error: "Validation failed",
+                details: error.errors,
+            });
+        }
+        console.error("Link coin to network error:", error);
+        res.status(500).json({
+            error: "Failed to link coin to network",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.linkCoinToNetwork = linkCoinToNetwork;
+const unlinkCoinFromNetwork = async (req, res) => {
+    try {
+        const { coinId, networkId } = req.params;
+        // Check if link exists
+        const link = await prisma_1.prisma.coinNetwork.findFirst({
+            where: {
+                coinId,
+                networkId,
+            },
+            include: {
+                coin: true,
+                network: true,
+            },
+        });
+        if (!link) {
+            return res.status(404).json({
+                error: "Link not found",
+                details: `No link found between coin ${coinId} and network ${networkId}`,
+            });
+        }
+        // Check if there are wallets using this link
+        const walletsCount = await prisma_1.prisma.wallet.count({
+            where: {
+                coinId,
+                contractAddress: link.contractAddress,
+            },
+        });
+        if (walletsCount > 0) {
+            return res.status(400).json({
+                error: "Cannot unlink",
+                details: "There are wallets using this coin-network combination",
+                walletsCount,
+                suggestion: "Deactivate the link instead or migrate wallets first",
+            });
+        }
+        await prisma_1.prisma.coinNetwork.delete({
+            where: { id: link.id },
+        });
+        res.json({
+            success: true,
+            message: "Coin unlinked from network successfully",
+            details: {
+                coin: link.coin.name,
+                network: link.network.name,
+            },
+        });
+    }
+    catch (error) {
+        console.error("Unlink coin from network error:", error);
+        res.status(500).json({
+            error: "Failed to unlink coin from network",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.unlinkCoinFromNetwork = unlinkCoinFromNetwork;
+const getCoinNetworks = async (req, res) => {
+    try {
+        const { coinId } = req.params;
+        // Check if coin exists
+        const coin = await prisma_1.prisma.coin.findUnique({
+            where: { id: coinId },
+        });
+        if (!coin) {
+            return res.status(404).json({
+                error: "Coin not found",
+                details: `Coin with ID ${coinId} does not exist`,
+            });
+        }
+        const networks = await prisma_1.prisma.coinNetwork.findMany({
+            where: { coinId },
+            include: {
+                network: true,
+            },
+            orderBy: { network: { name: "asc" } },
+        });
+        res.json({
+            success: true,
+            count: networks.length,
+            coin: {
+                id: coin.id,
+                name: coin.name,
+                symbol: coin.symbol,
+            },
+            networks,
+        });
+    }
+    catch (error) {
+        console.error("Get coin networks error:", error);
+        res.status(500).json({
+            error: "Failed to fetch coin networks",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.getCoinNetworks = getCoinNetworks;
+// User Management functions remain the same...
+const getAllUsersWithWallets = async (req, res) => {
+    try {
+        const users = await prisma_1.prisma.user.findMany({
+            include: {
+                wallets: {
+                    include: { coin: true },
+                },
+            },
+            orderBy: { createdAt: "desc" },
+        });
+        const sanitizedUsers = users.map((user) => {
+            const { password, ...rest } = user;
+            // SUM ALL WALLET BALANCES
+            const totalBalance = user.wallets.reduce((sum, w) => sum + (w.balance || 0), 0);
+            return {
+                ...rest,
+                totalBalance,
+            };
+        });
+        return res.json({
+            success: true,
+            count: sanitizedUsers.length,
+            users: sanitizedUsers,
+        });
+    }
+    catch (error) {
+        console.error("Fetch users error:", error);
+        return res.status(500).json({ error: "Failed to fetch users" });
+    }
+};
+exports.getAllUsersWithWallets = getAllUsersWithWallets;
+const getUserById = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const user = await prisma_1.prisma.user.findUnique({
+            where: { id },
+            include: {
+                wallets: { include: { coin: true } },
+                transactions: { orderBy: { createdAt: "desc" } },
+                kyc: true,
+                orders: true,
+            },
+        });
+        if (!user)
+            return res.status(404).json({ error: "User not found" });
+        const { password, ...rest } = user;
+        res.json(rest);
+    }
+    catch (error) {
+        res.status(500).json({ error: "Failed to fetch user" });
+    }
+};
+exports.getUserById = getUserById;
+const updateWalletSchema = zod_1.z.object({
+    walletId: zod_1.z.string(),
+    balance: zod_1.z.number().optional(),
+});
+const updateUserWallet = async (req, res) => {
+    try {
+        const { walletId, balance } = updateWalletSchema.parse(req.body);
+        const wallet = await prisma_1.prisma.wallet.update({
+            where: { id: walletId },
+            data: {
+                balance: balance !== undefined ? balance : undefined,
+            },
+            include: { coin: true },
+        });
+        res.json(wallet);
+    }
+    catch (error) {
+        res.status(400).json({ error: "Update failed" });
+    }
+};
+exports.updateUserWallet = updateUserWallet;
+const suspendUser = async (req, res) => {
+    try {
+        const adminId = req.user?.userId;
+        const userId = req.params.id;
+        if (!userId)
+            return res.status(400).json({ success: false, error: "Missing user id" });
+        const parsed = suspendSchema.parse(req.body);
+        const { suspend, reason } = parsed;
+        // Ensure target user exists
+        const target = await prisma_1.prisma.user.findUnique({ where: { id: userId } });
+        if (!target)
+            return res.status(404).json({ success: false, error: "User not found" });
+        // Prevent suspending an admin (optional)
+        if (target.role === "ADMIN") {
+            return res
+                .status(403)
+                .json({ success: false, error: "Cannot suspend admin users" });
+        }
+        const data = {
+            suspended: suspend,
+            suspendedReason: suspend ? reason ?? null : null,
+            suspendedBy: suspend ? adminId ?? null : null,
+            suspendedAt: suspend ? new Date() : null,
+        };
+        const updated = await prisma_1.prisma.user.update({
+            where: { id: userId },
+            data,
+            select: {
+                id: true,
+                email: true,
+                role: true,
+                suspended: true,
+                suspendedAt: true,
+                suspendedReason: true,
+                suspendedBy: true,
+                kycStatus: true,
+                createdAt: true,
+                updatedAt: true,
+            },
+        });
+        // Optionally: invalidate any active sessions / tokens here
+        // e.g., create a blacklisted token entry or call session service.
+        return res.json({
+            success: true,
+            message: suspend ? "User suspended" : "User unsuspended",
+            user: updated,
+        });
+    }
+    catch (err) {
+        if (err instanceof zod_1.z.ZodError) {
+            return res
+                .status(400)
+                .json({
+                success: false,
+                error: "Invalid payload",
+                details: err.errors,
+            });
+        }
+        console.error("suspendUser error", err);
+        return res
+            .status(500)
+            .json({ success: false, error: "Failed to update user suspension" });
+    }
+};
+exports.suspendUser = suspendUser;
+// Add these to your existing adminController.ts file:
+// Get market coins (public endpoint - for frontend display)
+const getMarketCoins = async (req, res) => {
+    try {
+        const coins = await prisma_1.prisma.coin.findMany({
+            where: { isActive: true },
+            include: {
+                networks: {
+                    where: { isActive: true },
+                    include: {
+                        network: true,
+                    },
+                },
+            },
+            orderBy: { name: "asc" },
+        });
+        res.json({
+            success: true,
+            count: coins.length,
+            coins,
+        });
+    }
+    catch (error) {
+        console.error("Get market coins error:", error);
+        res.status(500).json({
+            success: false,
+            error: "Failed to fetch market coins",
+            details: error instanceof Error ? error.message : "Unknown error",
+        });
+    }
+};
+exports.getMarketCoins = getMarketCoins;

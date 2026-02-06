@@ -1,0 +1,355 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum AdminAction {
+  NONE
+  APPROVE
+  REJECT
+  HOLD
+}
+
+enum TransactionType {
+  DEPOSIT
+  WITHDRAW
+  BANK_WITHDRAW
+  TRANSFER
+  BUY
+  SELL
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum OrderType {
+  BUY
+  SELL
+}
+
+enum OrderStatus {
+  PENDING
+  FILLED
+  CANCELLED
+}
+
+enum KycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum TradeDirection {
+  BULLISH
+  BEARISH
+}
+
+enum TradePeriod {
+  S30
+  M1
+  M5
+  M15
+}
+
+enum TradeStatus {
+  PENDING
+  SETTLED
+}
+
+enum TradeResult {
+  WIN
+  LOSS
+}
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  fullName     String?
+  password     String?
+  isVerified   Boolean   @default(false)
+  role         Role      @default(USER)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  kycStatus    KycStatus @default(PENDING)
+  tokenVersion Int       @default(0) // 👈 IMPORTANT
+
+  kyc          Kyc?
+  wallets      Wallet[]
+  orders       Order[]
+  transactions Transaction[]
+
+  adminActions    Transaction[] @relation("AdminActions")
+  suspended       Boolean       @default(false)
+  suspendedAt     DateTime?
+  suspendedReason String?
+  suspendedBy     String?
+  certificates    Certificate[]
+  supportTickets  SupportTicket[]
+
+  businessId      String?
+  business        Business?     @relation("BusinessUsers", fields: [businessId], references: [id])
+  ownedBusiness   Business?     @relation("BusinessOwner")
+}
+
+model Business {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  ownerId   String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner User   @relation("BusinessOwner", fields: [ownerId], references: [id])
+  users User[] @relation("BusinessUsers")
+}
+
+model SupportTicket {
+  id          String   @id @default(uuid())
+  userId      String
+  subject     String
+  message     String
+  status      String   @default("open")
+  adminReply  String?
+  adminId     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model MarketPair {
+  id          String @id @default(uuid())
+  baseCoinId  String
+  quoteCoinId String
+  networkId   String
+
+  symbol   String
+  wsSymbol String
+  isActive Boolean @default(true)
+
+  baseCoin  Coin    @relation("BaseCoin", fields: [baseCoinId], references: [id])
+  quoteCoin Coin    @relation("QuoteCoin", fields: [quoteCoinId], references: [id])
+  network   Network @relation(fields: [networkId], references: [id])
+
+  orders       Order[]
+  tradeConfigs TradeConfig[]
+
+  @@unique([baseCoinId, quoteCoinId, networkId])
+}
+
+model Kyc {
+  id         String    @id @default(uuid())
+  userId     String    @unique
+  status     KycStatus @default(PENDING)
+  frontImage String
+  backImage  String
+  reason     String?
+  reviewedBy String?
+  reviewedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Otp {
+  id        String   @id @default(uuid())
+  email     String
+  code      String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model BlacklistedToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model AdminWhitelist {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Coin {
+  id       String  @id @default(uuid())
+  symbol   String  @unique
+  name     String
+  iconUrl  String?
+  isActive Boolean @default(true)
+
+  networks CoinNetwork[]
+  wallets  Wallet[]
+  orders   Order[]
+
+  marketPairsAsBase  MarketPair[] @relation("BaseCoin")
+  marketPairsAsQuote MarketPair[] @relation("QuoteCoin")
+}
+
+model Certificate {
+  id         String   @id @default(uuid())
+  image      String // encrypted filename
+  uploadedBy String // admin id
+  createdAt  DateTime @default(now())
+
+  uploadedByUser User @relation(fields: [uploadedBy], references: [id])
+}
+
+model Network {
+  id          String  @id @default(uuid())
+  slug        String? @unique
+  name        String
+  type        String?
+  chainId     String?
+  icon        String?
+  description String?
+  isActive    Boolean @default(true)
+
+  coins       CoinNetwork[]
+  wallets     Wallet[]
+  orders      Order[]
+  marketPairs MarketPair[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime?
+}
+
+model CoinNetwork {
+  id              String  @id @default(uuid())
+  coinId          String
+  networkId       String
+  contractAddress String?
+  isActive        Boolean @default(true)
+  decimals        Int?    @default(18)
+
+  coin    Coin    @relation(fields: [coinId], references: [id], onDelete: Cascade)
+  network Network @relation(fields: [networkId], references: [id], onDelete: Cascade)
+
+  @@unique([coinId, networkId, contractAddress])
+}
+
+model Wallet {
+  id              String  @id @default(uuid())
+  userId          String
+  coinId          String
+  networkId       String?
+  balance         Float   @default(0.0)
+  address         String?
+  contractAddress String?
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  coin    Coin     @relation(fields: [coinId], references: [id], onDelete: Cascade)
+  network Network? @relation(fields: [networkId], references: [id], onDelete: SetNull)
+
+  transactions Transaction[]
+
+  @@unique([userId, coinId, networkId])
+}
+
+model Transaction {
+  id        String            @id @default(uuid())
+  userId    String
+  walletId  String?
+  type      TransactionType
+  amount    Float
+  status    TransactionStatus @default(PENDING)
+  txHash    String?
+  toAddress String?
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  // Dual-currency support (for deposits/conversions)
+  fromCoinId      String?       // Original coin (e.g., USDT)
+  toCoinId        String?       // Target coin (e.g., BTC)
+  fromAmount      Float?        // Amount in original coin
+  toAmount        Float?        // Equivalent amount in target coin
+  conversionRate  Float?        // Price at time of transaction
+
+  bankName      String?
+  accountName   String?
+  accountNumber String?
+  ifscCode      String?
+
+  adminId      String?
+  admin        User?        @relation("AdminActions", fields: [adminId], references: [id])
+  adminAction  AdminAction? @default(NONE)
+  adminMessage String?
+  receiptUrl   String?
+  screenshot   String?
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet Wallet? @relation(fields: [walletId], references: [id], onDelete: SetNull)
+}
+
+model Order {
+  id            String @id @default(uuid())
+  userId        String
+  marketPairId  String
+  tradeConfigId String
+  direction     TradeDirection // 👈 Moved here
+
+  stake      Decimal
+  entryPrice Decimal
+  profitRate Decimal
+
+  expiresAt DateTime
+  settledAt DateTime?
+  result    TradeResult?
+  status    TradeStatus  @default(PENDING)
+
+  createdAt DateTime @default(now())
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  marketPair  MarketPair  @relation(fields: [marketPairId], references: [id], onDelete: Cascade)
+  tradeConfig TradeConfig @relation(fields: [tradeConfigId], references: [id])
+  coin        Coin?       @relation(fields: [coinId], references: [id])
+  coinId      String?
+  network     Network?    @relation(fields: [networkId], references: [id])
+  networkId   String?
+
+  @@index([userId])
+  @@index([marketPairId])
+  @@index([tradeConfigId])
+}
+
+model TradeConfig {
+  id           String @id @default(uuid())
+  marketPairId String
+
+  period    TradePeriod
+
+  minStake   Decimal
+  maxStake   Decimal
+  profitRate Decimal
+
+  isActive Boolean @default(true)
+
+  marketPair MarketPair @relation(fields: [marketPairId], references: [id])
+  orders     Order[]
+
+  @@unique([marketPairId, period])
+}
+
+model ContactInfo {
+    id        String   @id @default(uuid())
+    email     String?
+    phone     String?
+    whatsapp  String?
+    address   String?
+    updatedAt DateTime @updatedAt
+}
