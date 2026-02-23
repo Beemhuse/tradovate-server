@@ -6,7 +6,7 @@ import { z } from "zod";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "brightawah94@gmail.com";
+const ADMIN_EMAIL = process.env.ADMIN_EMAI || "inspire.ig5702@gmail.com";
 
 const signupSchema = z.object({
   fullName: z.string(),
