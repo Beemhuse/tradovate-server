@@ -314,7 +314,7 @@ router.patch("/admin/:id/status", authenticateToken, requireRole("ADMIN"), updat
 
 router.get(
   "/image/:userId/:filename",
-  authenticateToken, requireRole("ADMIN"),
+  authenticateToken,
   getKycImage
 );
 export default router;

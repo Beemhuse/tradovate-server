@@ -26,7 +26,7 @@ type MulterFiles = {
 
 type MulterRequest = Request & {
   files?: MulterFiles;
-  user?: { id: string; role?: string }; // depends on your auth middleware
+  user?: { userId: string; id?: string; role?: string }; // Match AuthRequest structure
 };
 
 // schema for optional body fields
@@ -37,7 +37,7 @@ const submitKycSchema = z.object({
 
 export const getMyKyc = async (req: MulterRequest, res: Response) => {
   try {
-    const userId = req.user?.id;
+    const userId = req.user?.userId;
     if (!userId) {
       return res.status(401).json({ error: "Unauthorized" });
     }
@@ -47,15 +47,19 @@ export const getMyKyc = async (req: MulterRequest, res: Response) => {
       return res.status(404).json({ error: "KYC not found" });
     }
 
+    const baseUrl = process.env.BASE_URL || "http://localhost:9991/api/v1";
+
     return res.json({
-      id: kyc.id,
-      userId: kyc.userId,
-      status: kyc.status,
-      createdAt: kyc.createdAt,
-      reviewedAt: kyc.reviewedAt,
-      // ✅ return filenames only
-      frontImage: kyc.frontImage, // e.g. "1704123-abc.enc"
-      backImage: kyc.backImage,
+      success: true,
+      kyc: {
+        id: kyc.id,
+        userId: kyc.userId,
+        status: kyc.status,
+        createdAt: kyc.createdAt,
+        reviewedAt: kyc.reviewedAt,
+        frontImage: kyc.frontImage ? `${baseUrl}/kyc/image/${userId}/${kyc.frontImage}` : null,
+        backImage: kyc.backImage ? `${baseUrl}/kyc/image/${userId}/${kyc.backImage}` : null,
+      }
     });
   } catch (error) {
     console.error("getMyKyc error:", error);

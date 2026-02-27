@@ -339,25 +339,25 @@ export const getPairById = async (req: AuthRequest, res: Response) => {
     /* ===========================
        Fetch USDT wallet (same network)
     ============================ */
-    const usdtWallets = await prisma.wallet.findMany({
+    const usdtWallet = await prisma.wallet.findFirst({
       where: {
         userId,
         coin: { symbol: "USDT" },
+        networkId: pair.networkId,
       },
       select: {
+        id: true,
         balance: true,
       },
     });
-
-    const totalUsdtBalance = usdtWallets.reduce((sum, w) => sum + w.balance, 0);
 
     return res.json({
       success: true,
       pair,
       wallet: {
-        exists: totalUsdtBalance > 0,
-        walletId: null,
-        balance: totalUsdtBalance,
+        exists: Boolean(usdtWallet),
+        walletId: usdtWallet?.id ?? null,
+        balance: usdtWallet?.balance ?? 0,
       },
     });
   } catch (err) {
@@ -384,34 +384,21 @@ export const createTradeConfig = async (req: Request, res: Response) => {
     const payload = createConfigSchema.parse(req.body);
 
     if (payload.minStake >= payload.maxStake) {
-      return res
-        .status(400)
-        .json({ error: "minStake must be less than maxStake" });
+      return res.status(400).json({ error: "minStake must be less than maxStake" });
     }
 
-    const pair = await prisma.marketPair.findUnique({
-      where: { id: payload.marketPairId },
-    });
+    const pair = await prisma.marketPair.findUnique({ where: { id: payload.marketPairId } });
     if (!pair) {
       return res.status(404).json({ error: "Market pair not found" });
     }
 
     // Ensure unique period per pair
     const existing = await prisma.tradeConfig.findUnique({
-      where: {
-        marketPairId_period: {
-          marketPairId: payload.marketPairId,
-          period: payload.period as any,
-        },
-      },
+      where: { marketPairId_period: { marketPairId: payload.marketPairId, period: payload.period as any } },
     });
 
     if (existing) {
-      return res
-        .status(400)
-        .json({
-          error: "Trade config for this period already exists for the pair",
-        });
+      return res.status(400).json({ error: "Trade config for this period already exists for the pair" });
     }
 
     // Validate period against known enum values to avoid DB errors
@@ -436,8 +423,7 @@ export const createTradeConfig = async (req: Request, res: Response) => {
     return res.status(201).json({ success: true, config });
   } catch (err: any) {
     console.error("createTradeConfig error", err);
-    if (err instanceof z.ZodError)
-      return res.status(400).json({ error: err.errors });
+    if (err instanceof z.ZodError) return res.status(400).json({ error: err.errors });
     return res.status(500).json({ error: "Failed to create trade config" });
   }
 };
@@ -456,25 +442,19 @@ export const updateTradeConfig = async (req: Request, res: Response) => {
     const payload = updateConfigSchema.parse(req.body);
 
     const config = await prisma.tradeConfig.findUnique({ where: { id } });
-    if (!config)
-      return res.status(404).json({ error: "Trade config not found" });
+    if (!config) return res.status(404).json({ error: "Trade config not found" });
 
     if (payload.minStake !== undefined && payload.maxStake !== undefined) {
       if (payload.minStake >= payload.maxStake) {
-        return res
-          .status(400)
-          .json({ error: "minStake must be less than maxStake" });
+        return res.status(400).json({ error: "minStake must be less than maxStake" });
       }
     }
 
     // Convert numeric fields to strings for Prisma Decimal compatibility
     const data: any = {};
-    if (payload.minStake !== undefined)
-      data.minStake = payload.minStake.toString();
-    if (payload.maxStake !== undefined)
-      data.maxStake = payload.maxStake.toString();
-    if (payload.profitRate !== undefined)
-      data.profitRate = payload.profitRate.toString();
+    if (payload.minStake !== undefined) data.minStake = payload.minStake.toString();
+    if (payload.maxStake !== undefined) data.maxStake = payload.maxStake.toString();
+    if (payload.profitRate !== undefined) data.profitRate = payload.profitRate.toString();
     if (payload.isActive !== undefined) data.isActive = payload.isActive;
 
     const updated = await prisma.tradeConfig.update({ where: { id }, data });
@@ -482,8 +462,7 @@ export const updateTradeConfig = async (req: Request, res: Response) => {
     return res.json({ success: true, config: updated });
   } catch (err: any) {
     console.error("updateTradeConfig error", err);
-    if (err instanceof z.ZodError)
-      return res.status(400).json({ error: err.errors });
+    if (err instanceof z.ZodError) return res.status(400).json({ error: err.errors });
     return res.status(500).json({ error: "Failed to update trade config" });
   }
 };
@@ -493,8 +472,7 @@ export const deleteTradeConfig = async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     const config = await prisma.tradeConfig.findUnique({ where: { id } });
-    if (!config)
-      return res.status(404).json({ error: "Trade config not found" });
+    if (!config) return res.status(404).json({ error: "Trade config not found" });
 
     await prisma.tradeConfig.delete({ where: { id } });
 

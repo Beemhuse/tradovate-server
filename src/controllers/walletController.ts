@@ -538,6 +538,7 @@ export const requestDeposit = async (req: AuthRequest, res: Response) => {
     if (file) {
       finalReceiptUrl = encryptAndMoveReceipt(userId, file);
     }
+console.log(userId, finalReceiptUrl)
     // Verify wallet belongs to user
     const wallet = await prisma.wallet.findUnique({ where: { id: walletId } });
     if (!wallet || wallet.userId !== userId)
@@ -809,17 +810,10 @@ export const getWalletConversions = async (req: AuthRequest, res: Response) => {
     const toCoinParam = (req.query.toCoinId || req.query.to) as
       | string
       | undefined;
-    const fromWalletParam = (req.query.fromWalletId || req.query.fromWallet) as
-      | string
-      | undefined;
-    const toWalletParam = (req.query.toWalletId || req.query.toWallet) as
-      | string
-      | undefined;
     const amountParam = req.query.amount ? Number(req.query.amount) : undefined;
 
     // 💡 PORTFOLIO MODE: If no specific conversion is requested, return value of all wallets in USDT (or target)
-    // If wallet IDs are not provided and coin params are incomplete -> portfolio mode
-    if ((!fromCoinParam && !fromWalletParam) || (!toCoinParam && !toWalletParam) || amountParam === undefined) {
+    if (!fromCoinParam || !toCoinParam || amountParam === undefined) {
       const targetSymbol = (toCoinParam || "USDT").toUpperCase();
       const targetCoin = await prisma.coin.findFirst({
         where: {
@@ -867,48 +861,25 @@ export const getWalletConversions = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    /* 1️⃣ Validate inputs - support walletId (preferred) or coinId/symbol */
-    let fromWallet: any = null;
-    let toWallet: any = null;
-    let fromCoin: any = null;
-    let toCoin: any = null;
-
-    if (fromWalletParam) {
-      fromWallet = await prisma.wallet.findUnique({ where: { id: fromWalletParam }, include: { coin: true } });
-      if (!fromWallet) {
-        return res.status(404).json({ success: false, error: "Source wallet not found" });
-      }
-      fromCoin = fromWallet.coin;
-    }
-    if (toWalletParam) {
-      toWallet = await prisma.wallet.findUnique({ where: { id: toWalletParam }, include: { coin: true } });
-      if (!toWallet) {
-        return res.status(404).json({ success: false, error: "Target wallet not found" });
-      }
-      toCoin = toWallet.coin;
-    }
-
-    // fallback to coin params if wallets not provided
-    if (!fromWallet) {
-      fromCoin = await prisma.coin.findFirst({
+    /* 1️⃣ Validate coins (support ID or Symbol) */
+    const [fromCoin, toCoin] = await Promise.all([
+      prisma.coin.findFirst({
         where: {
           OR: [
-            { id: fromCoinParam && fromCoinParam.length === 36 ? fromCoinParam : undefined },
-            { symbol: fromCoinParam ? fromCoinParam.toUpperCase() : undefined },
+            { id: fromCoinParam.length === 36 ? fromCoinParam : undefined },
+            { symbol: fromCoinParam.toUpperCase() },
           ],
         },
-      });
-    }
-    if (!toWallet) {
-      toCoin = await prisma.coin.findFirst({
+      }),
+      prisma.coin.findFirst({
         where: {
           OR: [
-            { id: toCoinParam && toCoinParam.length === 36 ? toCoinParam : undefined },
-            { symbol: toCoinParam ? toCoinParam.toUpperCase() : undefined },
+            { id: toCoinParam.length === 36 ? toCoinParam : undefined },
+            { symbol: toCoinParam.toUpperCase() },
           ],
         },
-      });
-    }
+      }),
+    ]);
 
     if (!fromCoin || !toCoin || !fromCoin.isActive || !toCoin.isActive) {
       return res.status(404).json({
@@ -917,37 +888,59 @@ export const getWalletConversions = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    // Allow same-coin conversions and same-wallet transfers (no-op transfer allowed)
+    if (fromCoin.id === toCoin.id) {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot convert to the same wallet",
+      });
+    }
 
     /* 2️⃣ Check source wallet */
-    // Determine actual source/target wallets for preview if wallet IDs were not provided
-    if (!fromWallet) {
-      fromWallet = await prisma.wallet.findFirst({ where: { userId, coinId: fromCoin.id }, include: { coin: true } });
-    }
-    if (!toWallet) {
-      toWallet = await prisma.wallet.findFirst({ where: { userId, coinId: toCoin.id }, include: { coin: true } });
-    }
+    const fromWallet = await prisma.wallet.findFirst({
+      where: { userId, coinId: fromCoin.id },
+    });
 
     if (!fromWallet || fromWallet.balance < amountParam) {
-      return res.status(400).json({ success: false, error: `Insufficient ${fromCoin.symbol} balance` });
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient ${fromCoin.symbol} balance`,
+      });
     }
+
+    /* 3️⃣ Check target wallet */
+    const toWallet = await prisma.wallet.findFirst({
+      where: { userId, coinId: toCoin.id },
+    });
 
     if (!toWallet) {
-      return res.status(400).json({ success: false, error: `Target wallet for ${toCoin.symbol} not found` });
+      return res.status(400).json({
+        success: false,
+        error: `Target wallet for ${toCoin.symbol} not found`,
+      });
     }
 
-    /* 4️⃣ 1:1 Conversion (no market prices) */
-    const conversionRate = 1;
-    const convertedAmount = amountParam;
+    /* 4️⃣ Get Market Rates */
+    const fromPrice = await getPriceByCoinSymbol(fromCoin.symbol);
+    const toPrice = await getPriceByCoinSymbol(toCoin.symbol);
+
+    // if (!fromPrice || !toPrice) {
+    //   return res.status(400).json({
+    //     success: false,
+    //     error: "Market prices not available for conversion",
+    //   });
+    // }
+
+    // const conversionRate = fromPrice / toPrice;
+    // const convertedAmount = amountParam * conversionRate;
 
     return res.json({
       success: true,
       mode: "single",
-      from: fromWallet.coin.symbol,
-      to: toWallet.coin.symbol,
+      from: fromCoin.symbol,
+      to: toCoin.symbol,
       amount: amountParam,
-      conversionRate,
-      convertedAmount,
+      // conversionRate,
+      // convertedAmount,
     });
   } catch (error) {
     console.error("Conversion preview error:", error);
@@ -962,87 +955,91 @@ export const executeConversion = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user!.userId;
 
-    // Accept either wallet IDs (preferred) or coin IDs
-    const body = req.body as any;
-    const amount = Number(body.amount);
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid amount" });
+    const { fromCoinId, toCoinId, amount } = z
+      .object({
+        fromCoinId: z.string().uuid(),
+        toCoinId: z.string().uuid(),
+        amount: z.coerce.number().positive(),
+      })
+      .parse(req.body);
+
+    if (fromCoinId === toCoinId) {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot move funds to the same wallet",
+      });
     }
-
-    let fromWalletId = body.fromWalletId || body.fromWalletId;
-    let toWalletId = body.toWalletId || body.toWalletId;
-    let fromCoinId = body.fromCoinId;
-    let toCoinId = body.toCoinId;
-
-    // allow same coin ids; moving to the same wallet will be treated as a no-op transfer
 
     /* 1️⃣ Fetch coins (validation only) */
-    // Resolve wallets and coins depending on provided identifiers
-    let fromWallet: any = null;
-    let toWallet: any = null;
-    let fromCoin: any = null;
-    let toCoin: any = null;
+    const [fromCoin, toCoin] = await Promise.all([
+      prisma.coin.findUnique({
+        where: { id: fromCoinId },
+      }),
+      prisma.coin.findUnique({
+        where: { id: toCoinId },
+      }),
+    ]);
 
-    if (fromWalletId) {
-      fromWallet = await prisma.wallet.findUnique({ where: { id: fromWalletId }, include: { coin: true } });
-      if (!fromWallet) return res.status(404).json({ success: false, error: "Source wallet not found" });
-      fromCoin = fromWallet.coin;
-    } else if (fromCoinId) {
-      fromCoin = await prisma.coin.findUnique({ where: { id: fromCoinId } });
-      if (fromCoin) {
-        fromWallet = await prisma.wallet.findFirst({ where: { userId, coinId: fromCoin.id }, include: { coin: true } });
-      }
+    if (!fromCoin || !toCoin || !fromCoin.isActive || !toCoin.isActive) {
+      return res.status(404).json({
+        success: false,
+        error: "One or both coins are not supported",
+      });
     }
 
-    if (toWalletId) {
-      toWallet = await prisma.wallet.findUnique({ where: { id: toWalletId }, include: { coin: true } });
-      if (!toWallet) return res.status(404).json({ success: false, error: "Target wallet not found" });
-      toCoin = toWallet.coin;
-    } else if (toCoinId) {
-      toCoin = await prisma.coin.findUnique({ where: { id: toCoinId } });
-      if (toCoin) {
-        toWallet = await prisma.wallet.findFirst({ where: { userId, coinId: toCoin.id }, include: { coin: true } });
-      }
+    /* 2️⃣ Fetch wallets */
+    const [fromWallet, toWallet] = await Promise.all([
+      prisma.wallet.findFirst({
+        where: { userId, coinId: fromCoinId },
+      }),
+      prisma.wallet.findFirst({
+        where: { userId, coinId: toCoinId },
+      }),
+    ]);
+
+    if (!fromWallet || fromWallet.balance < amount) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient ${fromCoin.symbol} balance`,
+      });
     }
 
-    if (!fromWallet || !toWallet) {
-      return res.status(400).json({ success: false, error: "Source or target wallet not found" });
+    if (!toWallet) {
+      return res.status(400).json({
+        success: false,
+        error: `Target wallet for ${toCoin.symbol} not found`,
+      });
     }
 
-    if (fromWallet.balance < amount) {
-      return res.status(400).json({ success: false, error: `Insufficient ${fromWallet.coin.symbol} balance` });
+    /* 3️⃣ Get Market Rates & Calculate Payout */
+    const fromPrice = await getPriceByCoinSymbol(fromCoin.symbol);
+    const toPrice = await getPriceByCoinSymbol(toCoin.symbol);
+
+    if (!fromPrice || !toPrice) {
+      return res.status(400).json({
+        success: false,
+        error: "Market prices not available for conversion execution",
+      });
     }
 
-    // 1:1 conversion - no market price usage
-    const conversionRate = 1;
-    const convertedAmount = amount;
+    const conversionRate = fromPrice / toPrice;
+    const convertedAmount = amount * conversionRate;
 
     /* 4️⃣ Atomic internal transfer */
-    // If source and target are the same wallet, don't update balances (no-op), but record a transaction
-    if (fromWallet.id === toWallet.id) {
-      const txRecord = await prisma.transaction.create({
+    const transaction = await prisma.$transaction(async (tx) => {
+      await tx.wallet.update({
+        where: { id: fromWallet.id },
         data: {
-          userId,
-          walletId: fromWallet.id,
-          type: "TRANSFER",
-          status: "COMPLETED",
-          amount,
-          fromCoinId: fromWallet.coin.id,
-          toCoinId: toWallet.coin.id,
-          fromAmount: amount,
-          toAmount: convertedAmount,
-          conversionRate,
-          txHash: `conv_${Date.now()}`,
+          balance: { decrement: amount },
         },
       });
 
-      return res.json({ success: true, message: "Funds moved successfully", transaction: txRecord });
-    }
-
-    const transaction = await prisma.$transaction(async (tx) => {
-      await tx.wallet.update({ where: { id: fromWallet.id }, data: { balance: { decrement: amount } } });
-
-      await tx.wallet.update({ where: { id: toWallet.id }, data: { balance: { increment: convertedAmount } } });
+      await tx.wallet.update({
+        where: { id: toWallet.id },
+        data: {
+          balance: { increment: amount },
+        },
+      });
 
       return tx.transaction.create({
         data: {
@@ -1055,8 +1052,8 @@ export const executeConversion = async (req: AuthRequest, res: Response) => {
           amount,
 
           // AUDIT FIELDS
-          fromCoinId: fromWallet.coin.id,
-          toCoinId: toWallet.coin.id,
+          fromCoinId,
+          toCoinId,
           fromAmount: amount,
           toAmount: convertedAmount,
           conversionRate,
@@ -1066,7 +1063,11 @@ export const executeConversion = async (req: AuthRequest, res: Response) => {
       });
     });
 
-    return res.json({ success: true, message: "Funds moved successfully", transaction });
+    return res.json({
+      success: true,
+      message: "Funds moved successfully",
+      transaction,
+    });
   } catch (err) {
     console.error("executeConversion error:", err);
 
