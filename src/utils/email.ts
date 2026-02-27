@@ -4,8 +4,6 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const resend = new Resend(process.env.RESEND_API_KEY); // must be set in env
-console.log(process.env.RESEND_API_KEY, "resend api key loaded");
-console.log(process.env.RESEND_FROM_EMAIL, "resend EMAIL loaded");
 export const sendOtpEmail = async (email: string, otp: string) => {
   try {
     const { data, error } = await resend.emails.send({
